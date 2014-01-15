@@ -466,7 +466,7 @@ static int cp2112_probe(struct hid_device *hdev, const struct hid_device_id *id)
 	ret = i2c_add_adapter(&dev->adap);
 	hid_device_io_stop(hdev);
 	hid_hw_power(hdev, PM_HINT_NORMAL);
-	hid_hw_close(hdev);
+
 	if (ret) {
 		hid_err(hdev, "error registering i2c adapter\n");
 		kfree(dev);
@@ -490,6 +490,7 @@ static void cp2112_remove(struct hid_device *hdev)
 	hid_hw_stop(hdev);
 	i2c_del_adapter(&dev->adap);
 	kfree(dev);
+	hid_hw_close(hdev);
 }
 
 static int cp2112_raw_event(struct hid_device *hdev, struct hid_report *report,
