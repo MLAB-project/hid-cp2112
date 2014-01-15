@@ -18,22 +18,28 @@
   Foundation, Inc., 675 Mass Ave, Cambridge, MA 02139, USA.
  */
 
+/*
+  The Silicon Labs CP2112 chip is a USB HID device which provides an
+  SMBus controller for talking to slave devices. The host communicates
+  with the CP2112 via raw HID reports.
+ */
+
 #include <linux/hid.h>
 #include <linux/i2c.h>
 #include <linux/module.h>
 #include "hid-ids.h"
 
 enum {
-	GET_VERSION_INFO = 0x05,
-	SMBUS_CONFIG = 0x06,
-	DATA_READ_REQUEST = 0x10,
-	DATA_WRITE_READ_REQUEST = 0x11,
-	DATA_READ_FORCE_SEND = 0x12,
-	DATA_READ_RESPONSE = 0x13,
-	DATA_WRITE_REQUEST = 0x14,
-	TRANSFER_STATUS_REQUEST = 0x15,
-	TRANSFER_STATUS_RESPONSE = 0x16,
-	CANCEL_TRANSFER = 0x17,
+	CP2112_GET_VERSION_INFO = 0x05,
+	CP2112_SMBUS_CONFIG = 0x06,
+	CP2112_DATA_READ_REQUEST = 0x10,
+	CP2112_DATA_WRITE_READ_REQUEST = 0x11,
+	CP2112_DATA_READ_FORCE_SEND = 0x12,
+	CP2112_DATA_READ_RESPONSE = 0x13,
+	CP2112_DATA_WRITE_REQUEST = 0x14,
+	CP2112_TRANSFER_STATUS_REQUEST = 0x15,
+	CP2112_TRANSFER_STATUS_RESPONSE = 0x16,
+	CP2112_CANCEL_TRANSFER = 0x17,
 };
 
 enum {
@@ -53,7 +59,7 @@ enum {
 };
 
 /* All values are in big-endian */
-struct __attribute__ ((__packed__)) smbus_config {
+struct __attribute__ ((__packed__)) cp2112_smbus_config {
 	uint32_t clock_speed; /* Hz */
 	uint8_t device_address; /* Stored in the upper 7 bits */
 	uint8_t auto_send_read; /* 1 = enabled, 0 = disabled */
@@ -63,10 +69,16 @@ struct __attribute__ ((__packed__)) smbus_config {
 	uint16_t retry_time; /* # of retries, 0 = no limit */
 };
 
-static const int MAX_TIMEOUT = 100;
+/* Number of times to request transfer status before giving up waiting for a
+   transfer to complete. */
+static const int XFER_TIMEOUT = 100;
+
+/* Time in ms to wait for a CP2112_DATA_READ_RESPONSE or
+   CP2112_TRANSFER_STATUS_RESPONSE. */
+static const int RESPONSE_TIMEOUT = 50;
 
 static const struct hid_device_id cp2112_devices[] = {
-	{ HID_USB_DEVICE(USB_VENDOR_ID_CYGNAL, 0xEA90) },
+	{ HID_USB_DEVICE(USB_VENDOR_ID_CYGNAL, USB_DEVICE_ID_CYGNAL_CP2112) },
 	{ }
 };
 MODULE_DEVICE_TABLE(hid, cp2112_devices);
@@ -87,7 +99,7 @@ static int cp2112_wait(struct cp2112_device *dev, atomic_t *avail)
 	int ret = 0;
 
 	ret = wait_event_interruptible_timeout(dev->wait,
-		atomic_read(avail), msecs_to_jiffies(50));
+		atomic_read(avail), msecs_to_jiffies(RESPONSE_TIMEOUT));
 	if (-ERESTARTSYS == ret)
 		return ret;
 	if (!ret)
@@ -96,16 +108,47 @@ static int cp2112_wait(struct cp2112_device *dev, atomic_t *avail)
 	return 0;
 }
 
+static int cp2112_hid_get(struct hid_device *hdev, unsigned char report_number,
+			  uint8_t *data, size_t count,
+			  unsigned char report_type)
+{
+	uint8_t *buf;
+	int ret;
+
+	buf = kmalloc(count, GFP_KERNEL);
+	if (!buf)
+		return -ENOMEM;
+	ret = hdev->hid_get_raw_report(hdev, report_number, buf, count,
+				       report_type);
+	memcpy(data, buf, count);
+	kfree(buf);
+	return ret;
+}
+
+static int cp2112_hid_output(struct hid_device *hdev, uint8_t *data,
+			     size_t count, unsigned char report_type)
+{
+	uint8_t *buf;
+	int ret;
+
+	buf = kmemdup(data, count, GFP_KERNEL);
+	if (!buf)
+		return -ENOMEM;
+	ret = hdev->hid_output_raw_report(hdev, buf, count, report_type);
+	kfree(buf);
+	return ret;
+}
+
 static int cp2112_xfer_status(struct cp2112_device *dev)
 {
 	struct hid_device *hdev = dev->hdev;
 	uint8_t buf[2];
 	int ret;
 
-	buf[0] = TRANSFER_STATUS_REQUEST;
+	buf[0] = CP2112_TRANSFER_STATUS_REQUEST;
 	buf[1] = 0x01;
 	atomic_set(&dev->xfer_avail, 0);
-	ret = hdev->hid_output_raw_report(hdev, buf, 2, HID_OUTPUT_REPORT);
+	ret = cp2112_hid_output(hdev, buf, 2, HID_OUTPUT_REPORT);
 	if (ret < 0) {
 		hid_warn(hdev, "Error requesting status: %d\n", ret);
 		return ret;
@@ -122,10 +165,10 @@ static int cp2112_read(struct cp2112_device *dev, uint8_t *data, size_t size)
 	uint8_t buf[3];
 	int ret;
 
-	buf[0] = DATA_READ_FORCE_SEND;
+	buf[0] = CP2112_DATA_READ_FORCE_SEND;
 	*(uint16_t *)&buf[1] = htons(size);
 	atomic_set(&dev->read_avail, 0);
-	ret = hdev->hid_output_raw_report(hdev, buf, 3, HID_OUTPUT_REPORT);
+	ret = cp2112_hid_output(hdev, buf, 3, HID_OUTPUT_REPORT);
 	if (ret < 0) {
 		hid_warn(hdev, "Error requesting data: %d\n", ret);
 		return ret;
@@ -141,121 +184,123 @@ static int cp2112_read(struct cp2112_device *dev, uint8_t *data, size_t size)
 	return dev->read_length;
 }
 
+static int cp2112_read_req(uint8_t *buf, uint8_t slave_address, uint16_t length)
+{
+	if (length < 1 || length > 512)
+		return -EINVAL;
+	buf[0] = CP2112_DATA_READ_REQUEST;
+	buf[1] = slave_address << 1;
+	*(uint16_t *)&buf[2] = htons(length);
+	return 4;
+}
+
+static int cp2112_write_read_req(uint8_t *buf, uint8_t slave_address,
+				 uint16_t length, uint8_t command,
+				 uint8_t *data, uint8_t data_length)
+{
+	if (length < 1 || length > 512 || data_length > 15)
+		return -EINVAL;
+	buf[0] = CP2112_DATA_WRITE_READ_REQUEST;
+	buf[1] = slave_address << 1;
+	*(uint16_t *)&buf[2] = htons(length);
+	buf[4] = data_length + 1;
+	buf[5] = command;
+	memcpy(&buf[6], data, data_length);
+	return data_length + 6;
+}
+
+static int cp2112_write_req(uint8_t *buf, uint8_t slave_address,
+			    uint8_t command, uint8_t *data, uint8_t data_length)
+{
+	if (data_length > 60)
+		return -EINVAL;
+	buf[0] = CP2112_DATA_WRITE_REQUEST;
+	buf[1] = slave_address << 1;
+	buf[2] = data_length + 1;
+	buf[3] = command;
+	memcpy(&buf[4], data, data_length);
+	return data_length + 4;
+}
+
 static int cp2112_xfer(struct i2c_adapter *adap, uint16_t addr,
-	unsigned short flags, char read_write, uint8_t command,
-	int size, union i2c_smbus_data *data)
+		       unsigned short flags, char read_write, uint8_t command,
+		       int size, union i2c_smbus_data *data)
 {
 	struct cp2112_device *dev = (struct cp2112_device *)adap->algo_data;
 	struct hid_device *hdev = dev->hdev;
 	uint8_t buf[64];
+	uint16_t word;
 	size_t count;
 	size_t read_length = 0;
-	size_t write_length;
 	size_t timeout;
 	int ret;
 
 	hid_dbg(hdev, "%s addr 0x%x flags 0x%x cmd 0x%x size %d\n",
 		read_write == I2C_SMBUS_WRITE ? "write" : "read",
 		addr, flags, command, size);
-	buf[1] = addr << 1;
 	switch (size) {
 	case I2C_SMBUS_BYTE:
-		if (I2C_SMBUS_READ == read_write) {
-			read_length = 1;
-			buf[0] = DATA_READ_REQUEST;
-			*(uint16_t *)&buf[2] = htons(read_length);
-			count = 4;
-		} else {
-			write_length = 1;
-			buf[0] = DATA_WRITE_REQUEST;
-			buf[2] = write_length;
-			buf[3] = data->byte;
-			count = 4;
-		}
+		read_length = 1;
+		if (I2C_SMBUS_READ == read_write)
+			count = cp2112_read_req(buf, addr, read_length);
+		else
+			count = cp2112_write_req(buf, addr, data->byte, NULL,
+						 0);
 		break;
 	case I2C_SMBUS_BYTE_DATA:
-		if (I2C_SMBUS_READ == read_write) {
-			read_length = 1;
-			buf[0] = DATA_WRITE_READ_REQUEST;
-			*(uint16_t *)&buf[2] = htons(read_length);
-			buf[4] = 1;
-			buf[5] = command;
-			count = 6;
-		} else {
-			write_length = 2;
-			buf[0] = DATA_WRITE_REQUEST;
-			buf[2] = write_length;
-			buf[3] = command;
-			buf[4] = data->byte;
-			count = 5;
-		}
+		read_length = 1;
+		if (I2C_SMBUS_READ == read_write)
+			count = cp2112_write_read_req(buf, addr, read_length,
+						      command, NULL, 0);
+		else
+			count = cp2112_write_req(buf, addr, command,
+						 &data->byte, 1);
 		break;
 	case I2C_SMBUS_WORD_DATA:
-		if (I2C_SMBUS_READ == read_write) {
-			read_length = 2;
-			buf[0] = DATA_WRITE_READ_REQUEST;
-			*(uint16_t *)&buf[2] = htons(read_length);
-			buf[4] = 1;
-			buf[5] = command;
-			count = 6;
-		} else {
-			write_length = 3;
-			buf[0] = DATA_WRITE_REQUEST;
-			buf[2] = write_length;
-			buf[3] = command;
-			*(uint16_t *)&buf[4] = htons(data->word);
-			count = 6;
-		}
+		read_length = 2;
+		word = htons(data->word);
+		if (I2C_SMBUS_READ == read_write)
+			count = cp2112_write_read_req(buf, addr, read_length,
+						      command, NULL, 0);
+		else
+			count = cp2112_write_req(buf, addr, command,
+						 (uint8_t *)&word, 2);
 		break;
 	case I2C_SMBUS_PROC_CALL:
 		size = I2C_SMBUS_WORD_DATA;
 		read_write = I2C_SMBUS_READ;
 		read_length = 2;
-		write_length = 3;
-		buf[0] = DATA_WRITE_READ_REQUEST;
-		*(uint16_t *)&buf[2] = htons(read_length);
-		buf[4] = write_length;
-		buf[5] = command;
-		*(uint16_t *)&buf[6] = data->word;
-		count = 8;
+		word = htons(data->word);
+		count = cp2112_write_read_req(buf, addr, read_length, command,
+					      (uint8_t *)&word, 2);
 		break;
 	case I2C_SMBUS_I2C_BLOCK_DATA:
 		size = I2C_SMBUS_BLOCK_DATA;
 		/* fallthrough */
 	case I2C_SMBUS_BLOCK_DATA:
 		if (I2C_SMBUS_READ == read_write) {
-			buf[0] = DATA_WRITE_READ_REQUEST;
-			*(uint16_t *)&buf[2] = htons(I2C_SMBUS_BLOCK_MAX);
-			buf[4] = 1;
-			buf[5] = command;
-			count = 6;
+			count = cp2112_write_read_req(buf, addr,
+						      I2C_SMBUS_BLOCK_MAX,
+						      command, NULL, 0);
 		} else {
-			write_length = data->block[0];
-			if (write_length > 61 - 2)
-				return -EINVAL;
-			buf[0] = DATA_WRITE_REQUEST;
-			buf[2] = write_length + 2;
-			buf[3] = command;
-			memcpy(&buf[4], data->block, write_length + 1);
-			count = 5 + write_length;
+			count = cp2112_write_req(buf, addr, command,
+						 data->block,
+						 data->block[0] + 1);
 		}
 		break;
 	case I2C_SMBUS_BLOCK_PROC_CALL:
 		size = I2C_SMBUS_BLOCK_DATA;
 		read_write = I2C_SMBUS_READ;
-		write_length = data->block[0];
-		if (write_length > 16 - 2)
-			return -EINVAL;
-		buf[0] = DATA_WRITE_READ_REQUEST;
-		*(uint16_t *)&buf[2] = htons(I2C_SMBUS_BLOCK_MAX);
-		buf[4] = write_length + 2;
-		buf[5] = command;
-		memcpy(&buf[6], data->block, write_length + 1);
-		count = 7 + write_length;
+		count = cp2112_write_read_req(buf, addr, I2C_SMBUS_BLOCK_MAX,
+					      command, data->block,
+					      data->block[0] + 1);
+		break;
 	default:
 		hid_warn(hdev, "Unsupported transaction %d\n", size);
 		return -EOPNOTSUPP;
 	}
+	if (count < 0)
+		return count;
 	ret = hid_hw_open(hdev);
 	if (ret) {
 		hid_err(hdev, "hw open failed\n");
@@ -266,12 +311,12 @@ static int cp2112_xfer(struct i2c_adapter *adap, uint16_t addr,
 		hid_err(hdev, "power management error: %d\n", ret);
 		goto hid_close;
 	}
-	ret = hdev->hid_output_raw_report(hdev, buf, count, HID_OUTPUT_REPORT);
+	ret = cp2112_hid_output(hdev, buf, count, HID_OUTPUT_REPORT);
 	if (ret < 0) {
 		hid_warn(hdev, "Error starting transaction: %d\n", ret);
 		goto power_normal;
 	}
-	for (timeout = 0; timeout < MAX_TIMEOUT; ++timeout) {
+	for (timeout = 0; timeout < XFER_TIMEOUT; ++timeout) {
 		ret = cp2112_xfer_status(dev);
 		if (-EBUSY == ret)
 			continue;
@@ -279,15 +324,14 @@ static int cp2112_xfer(struct i2c_adapter *adap, uint16_t addr,
 			goto power_normal;
 		break;
 	}
-	if (MAX_TIMEOUT <= timeout) {
+	if (XFER_TIMEOUT <= timeout) {
 		hid_warn(hdev, "Transfer timed out, cancelling.\n");
-		buf[0] = CANCEL_TRANSFER;
+		buf[0] = CP2112_CANCEL_TRANSFER;
 		buf[1] = 0x01;
-		ret = hdev->hid_output_raw_report(hdev, buf, 2,
-			HID_OUTPUT_REPORT);
+		ret = cp2112_hid_output(hdev, buf, 2, HID_OUTPUT_REPORT);
 		if (ret < 0) {
 			hid_warn(hdev, "Error cancelling transaction: %d\n",
-				ret);
+				 ret);
 		}
 		ret = -ETIMEDOUT;
 		goto power_normal;
@@ -331,7 +375,7 @@ hid_close:
 	return ret;
 }
 
-static uint32_t cp2122_functionality(struct i2c_adapter *adap)
+static uint32_t cp2112_functionality(struct i2c_adapter *adap)
 {
 	return I2C_FUNC_SMBUS_BYTE |
 		I2C_FUNC_SMBUS_BYTE_DATA |
@@ -344,15 +388,14 @@ static uint32_t cp2122_functionality(struct i2c_adapter *adap)
 
 static const struct i2c_algorithm smbus_algorithm = {
 	.smbus_xfer	= cp2112_xfer,
-	.functionality	= cp2122_functionality,
+	.functionality	= cp2112_functionality,
 };
 
-static int
-cp2112_probe(struct hid_device *hdev, const struct hid_device_id *id)
+static int cp2112_probe(struct hid_device *hdev, const struct hid_device_id *id)
 {
 	struct cp2112_device *dev;
 	uint8_t buf[64];
-	struct smbus_config *config;
+	struct cp2112_smbus_config *config;
 	int ret;
 
 	ret = hid_parse(hdev);
@@ -360,37 +403,54 @@ cp2112_probe(struct hid_device *hdev, const struct hid_device_id *id)
 		hid_err(hdev, "parse failed\n");
 		return ret;
 	}
-	ret = hid_hw_start(hdev, HID_CONNECT_DEFAULT);
+	ret = hid_hw_start(hdev, HID_CONNECT_HIDRAW);
 	if (ret) {
 		hid_err(hdev, "hw start failed\n");
 		return ret;
 	}
-	ret = hdev->hid_get_raw_report(hdev, GET_VERSION_INFO, buf, 3,
-		HID_FEATURE_REPORT);
+	ret = hid_hw_open(hdev);
+	if (ret) {
+		hid_err(hdev, "hw open failed\n");
+		goto hid_stop;
+	}
+	ret = hid_hw_power(hdev, PM_HINT_FULLON);
+	if (ret < 0) {
+		hid_err(hdev, "power management error: %d\n", ret);
+		goto hid_close;
+	}
+	ret = cp2112_hid_get(hdev, CP2112_GET_VERSION_INFO, buf, 3,
+			     HID_FEATURE_REPORT);
 	if (ret != 3) {
 		hid_err(hdev, "error requesting version\n");
-		return ret;
+		if (ret >= 0)
+			ret = -EIO;
+		goto power_normal;
 	}
 	hid_info(hdev, "Part Number: 0x%02X Device Version: 0x%02X\n",
-		buf[1], buf[2]);
-	ret = hdev->hid_get_raw_report(hdev, SMBUS_CONFIG, buf,
-		sizeof(*config) + 1, HID_FEATURE_REPORT);
+		 buf[1], buf[2]);
+	ret = cp2112_hid_get(hdev, CP2112_SMBUS_CONFIG, buf,
+			     sizeof(*config) + 1, HID_FEATURE_REPORT);
 	if (ret != sizeof(*config) + 1) {
 		hid_err(hdev, "error requesting SMBus config\n");
-		return ret;
+		if (ret >= 0)
+			ret = -EIO;
+		goto power_normal;
 	}
-	config = (struct smbus_config *)&buf[1];
+	config = (struct cp2112_smbus_config *)&buf[1];
 	config->retry_time = htons(1);
-	ret = hdev->hid_output_raw_report(hdev, buf,
-		sizeof(*config) + 1, HID_FEATURE_REPORT);
+	ret = cp2112_hid_output(hdev, buf, sizeof(*config) + 1,
+				HID_FEATURE_REPORT);
 	if (ret != sizeof(*config) + 1) {
 		hid_err(hdev, "error setting SMBus config\n");
-		return ret;
+		if (ret >= 0)
+			ret = -EIO;
+		goto power_normal;
 	}
 	dev = kzalloc(sizeof(*dev), GFP_KERNEL);
 	if (!dev) {
 		hid_err(hdev, "out of memory\n");
-		return -ENOMEM;
+		ret = -ENOMEM;
+		goto power_normal;
 	}
 	dev->hdev = hdev;
 	hid_set_drvdata(hdev, (void *)dev);
@@ -398,18 +458,28 @@ cp2112_probe(struct hid_device *hdev, const struct hid_device_id *id)
 	dev->adap.class		= I2C_CLASS_HWMON;
 	dev->adap.algo		= &smbus_algorithm;
 	dev->adap.algo_data	= dev;
+	dev->adap.dev.parent	= &hdev->dev;
 	snprintf(dev->adap.name, sizeof(dev->adap.name),
-		"CP2112 SMBus Bridge on hiddev%d", hdev->minor);
+		 "CP2112 SMBus Bridge on hiddev%d", hdev->minor);
 	init_waitqueue_head(&dev->wait);
 	hid_device_io_start(hdev);
 	ret = i2c_add_adapter(&dev->adap);
 	hid_device_io_stop(hdev);
+	hid_hw_power(hdev, PM_HINT_NORMAL);
+	hid_hw_close(hdev);
 	if (ret) {
 		hid_err(hdev, "error registering i2c adapter\n");
 		kfree(dev);
-		hid_set_drvdata(hdev, NULL);
+		goto hid_stop;
 	}
 	hid_dbg(hdev, "adapter registered\n");
+	return ret;
+power_normal:
+	hid_hw_power(hdev, PM_HINT_NORMAL);
+hid_close:
+	hid_hw_close(hdev);
+hid_stop:
+	hid_hw_stop(hdev);
 	return ret;
 }
 
@@ -417,22 +487,18 @@ static void cp2112_remove(struct hid_device *hdev)
 {
 	struct cp2112_device *dev = hid_get_drvdata(hdev);
 
-	if (dev) {
-		i2c_del_adapter(&dev->adap);
-		wake_up_interruptible(&dev->wait);
-		kfree(dev);
-		hid_set_drvdata(hdev, NULL);
-	}
 	hid_hw_stop(hdev);
+	i2c_del_adapter(&dev->adap);
+	kfree(dev);
 }
 
 static int cp2112_raw_event(struct hid_device *hdev, struct hid_report *report,
-	uint8_t *data, int size)
+			    uint8_t *data, int size)
 {
 	struct cp2112_device *dev = hid_get_drvdata(hdev);
 
 	switch (data[0]) {
-	case TRANSFER_STATUS_RESPONSE:
+	case CP2112_TRANSFER_STATUS_RESPONSE:
 		hid_dbg(hdev, "xfer status: %02x %02x %04x %04x\n",
 			data[1], data[2], htons(*(uint16_t *)&data[3]),
 			htons(*(uint16_t *)&data[5]));
@@ -462,7 +528,7 @@ static int cp2112_raw_event(struct hid_device *hdev, struct hid_report *report,
 		}
 		atomic_set(&dev->xfer_avail, 1);
 		break;
-	case DATA_READ_RESPONSE:
+	case CP2112_DATA_READ_RESPONSE:
 		hid_dbg(hdev, "read response: %02x %02x\n", data[1], data[2]);
 		dev->read_length = data[2];
 		if (dev->read_length > sizeof(dev->read_data))
@@ -486,18 +552,7 @@ static struct hid_driver cp2112_driver = {
 	.raw_event = cp2112_raw_event,
 };
 
-static int __init cp2112_init(void)
-{
-	return hid_register_driver(&cp2112_driver);
-}
-
-static void __exit cp2112_exit(void)
-{
-	hid_unregister_driver(&cp2112_driver);
-}
-
-module_init(cp2112_init);
-module_exit(cp2112_exit);
+module_hid_driver(cp2112_driver);
 MODULE_DESCRIPTION("Silicon Labs HID USB to SMBus master bridge");
 MODULE_AUTHOR("David Barksdale <dbarksdale@uplogix.com>");
 MODULE_LICENSE("GPL");
