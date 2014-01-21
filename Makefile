@@ -18,7 +18,7 @@ DRIVER2 := hid
 # the module:
 MOD_SUBDIR = drivers/misc
 
-obj-m	:= hid-cp2112.o hid-core.o
+obj-m	:= hid-cp2112.o hid-core.o i2c-mux-pca954x.o
 
 MAKEFLAGS += --no-print-directory
 #LDFLAGS += -lhid
