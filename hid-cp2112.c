@@ -69,7 +69,7 @@ enum {
        STATUS1_SUCCESS                 = 0x05,
 };
 
-struct __attribute__ ((__packed__)) cp2112_smbus_config_report {
+struct cp2112_smbus_config_report {
        u8 report;              /* CP2112_SMBUS_CONFIG */
        __be32 clock_speed;     /* Hz */
        u8 device_address;      /* Stored in the upper 7 bits */
@@ -78,9 +78,9 @@ struct __attribute__ ((__packed__)) cp2112_smbus_config_report {
        __be16 read_timeout;    /* ms, 0 = no timeout */
        u8 scl_low_timeout;     /* 1 = enabled, 0 = disabled */
        __be16 retry_time;      /* # of retries, 0 = no limit */
-};
+} __packed;
 
-struct  __attribute__ ((__packed__)) cp2112_usb_config_report {
+struct cp2112_usb_config_report {
        u8 report;      /* CP2112_USB_CONFIG */
        __le16 vid;     /* Vendor ID */
        __le16 pid;     /* Product ID */
@@ -91,54 +91,54 @@ struct  __attribute__ ((__packed__)) cp2112_usb_config_report {
        u8 release_major;
        u8 release_minor;
        u8 mask;        /* What fields to program */
-};
+} __packed;
 
-struct  __attribute__ ((__packed__)) cp2112_read_req_report {
+struct cp2112_read_req_report {
        u8 report;      /* CP2112_DATA_READ_REQUEST */
        u8 slave_address;
        __be16 length;
-};
+} __packed;
 
-struct  __attribute__ ((__packed__)) cp2112_write_read_req_report {
+struct cp2112_write_read_req_report {
        u8 report;      /* CP2112_DATA_WRITE_READ_REQUEST */
        u8 slave_address;
        __be16 length;
        u8 target_address_length;
        u8 target_address[16];
-};
+} __packed;
 
-struct  __attribute__ ((__packed__)) cp2112_write_req_report {
+struct cp2112_write_req_report {
        u8 report;      /* CP2112_DATA_WRITE_REQUEST */
        u8 slave_address;
        u8 length;
        u8 data[61];
-};
+} __packed;
 
-struct  __attribute__ ((__packed__)) cp2112_force_read_report {
+struct cp2112_force_read_report {
        u8 report;      /* CP2112_DATA_READ_FORCE_SEND */
        __be16 length;
-};
+} __packed;
 
-struct  __attribute__ ((__packed__)) cp2112_xfer_status_report {
+struct cp2112_xfer_status_report {
        u8 report;      /* CP2112_TRANSFER_STATUS_RESPONSE */
        u8 status0;     /* STATUS0_* */
        u8 status1;     /* STATUS1_* */
        __be16 retries;
        __be16 length;
-};
+} __packed;
 
-struct  __attribute__ ((__packed__)) cp2112_string_report {
+struct cp2112_string_report {
        u8 dummy;               /* force .string to be aligned */
        u8 report;              /* CP2112_*_STRING */
        u8 length;              /* length in bytes of everyting after .report */
        u8 type;                /* USB_DT_STRING */
        wchar_t string[30];     /* UTF16_LITTLE_ENDIAN string */
-};
+} __packed;
 
 /* Number of times to request transfer status before giving up waiting for a
    transfer to complete. This may need to be changed if SMBUS clock, retries,
    or read/write/scl_low timeout settings are changed. */
-static const int XFER_TIMEOUT = 10;
+static const int XFER_STATUS_RETRIES = 10;
 
 /* Time in ms to wait for a CP2112_DATA_READ_RESPONSE or
    CP2112_TRANSFER_STATUS_RESPONSE. */
@@ -428,7 +428,7 @@ static int cp2112_xfer(struct i2c_adapter *adap, u16 addr,
        __be16 word;
        size_t count;
        size_t read_length = 0;
-       size_t timeout;
+       unsigned int retries;
        int ret;
 
        hid_dbg(hdev, "%s addr 0x%x flags 0x%x cmd 0x%x size %d\n",
@@ -517,7 +517,7 @@ static int cp2112_xfer(struct i2c_adapter *adap, u16 addr,
                goto power_normal;
        }
 
-       for (timeout = 0; timeout < XFER_TIMEOUT; ++timeout) {
+       for (retries = 0; retries < XFER_STATUS_RETRIES; ++retries) {
                ret = cp2112_xfer_status(dev);
                if (-EBUSY == ret)
                        continue;
@@ -526,7 +526,7 @@ static int cp2112_xfer(struct i2c_adapter *adap, u16 addr,
                break;
        }
 
-       if (XFER_TIMEOUT <= timeout) {
+       if (XFER_STATUS_RETRIES <= retries) {
                hid_warn(hdev, "Transfer timed out, cancelling.\n");
                buf[0] = CP2112_CANCEL_TRANSFER;
                buf[1] = 0x01;
@@ -661,7 +661,7 @@ static ssize_t name##_show(struct device *kdev, \
        int ret = cp2112_get_usb_config(hdev, &cfg); \
        if (ret) \
                return ret; \
-       return scnprintf(buf, PAGE_SIZE, format, __VA_ARGS__); \
+       return scnprintf(buf, PAGE_SIZE, format, ##__VA_ARGS__); \
 } \
 DEVICE_ATTR_RW(name);
 
@@ -1021,6 +1021,7 @@ static int cp2112_raw_event(struct hid_device *hdev, struct hid_report *report,
                                break;
                        default:
                                dev->xfer_status = -EIO;
+                               break;
                        }
                        break;
                default:
