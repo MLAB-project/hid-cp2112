@@ -1,9 +1,9 @@
 hid-cp2112
 ==========
 
-Silicon Labs HID USB to SMBus master bridge driver
+Silicon Labs HID USB to SMBus master bridge driver. Driver should work only with kernel version 3.15+. Drivers does not create a new kernel I2C interface in older kernels than 3.15.
 
-This driver adds support for Silicon Laboratories CP2112 HID USB-to-SMBus Bridge to
+This driver will add support for Silicon Laboratories CP2112 HID USB-to-SMBus Bridge to
 the linux kernel. This IC is used in MLAB USBI2C01A module. 
 
 To build and install this driver, execute the following command sequence:
