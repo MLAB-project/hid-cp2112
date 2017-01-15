@@ -1,6 +1,8 @@
 hid-cp2112
 ==========
 
+This in an obsolete Repository! Please use the main linux kernel source files. 
+
 Silicon Labs HID USB to SMBus master bridge driver
 
 This driver adds support for Silicon Laboratories CP2112 HID USB-to-SMBus Bridge to
